@@ -34,10 +34,11 @@ def modify_depth_images(input_folder, output_folder, invalid_value):
         modified_pixels = random.sample(all_pixels.tolist(), num_modified_pixels)
 
         # 将修改的像素索引转换为对应的行和列坐标
-        modified_rows = modified_pixels // width
-        modified_cols = modified_pixels % width
+        modified_rows = [int(num / width) for num in modified_pixels]
+        modified_cols = [num % width for num in modified_pixels]
 
         # 在图像中将选中的像素的深度值设为无效值
+
         depth_image[modified_rows, modified_cols] = invalid_value
 
         # 保存修改后的深度图像
@@ -45,7 +46,7 @@ def modify_depth_images(input_folder, output_folder, invalid_value):
 
 # 指定输入文件夹和输出文件夹路径
 input_folder = './Datasets/Apartment/depth'
-output_folder = './Datasets/Apartment/random_filter_20'
+output_folder = './Datasets/Apartment/depth_random_filter_20'
 
 # 调用函数进行深度图像修改和保存
 modify_depth_images(input_folder, output_folder, invalid_value=0)
