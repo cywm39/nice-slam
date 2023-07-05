@@ -142,6 +142,9 @@ class Mapper(object):
             (uv[:, 1] < H-edge)*(uv[:, 1] > edge)
 
         # For ray with depth==0, fill it with maximum depth
+        # 原因：若使用depth判断哪些feature grid上的点需要优化，而depth为0的点处深度不可用，
+        # 所以保守起见depth设置为最大值，让这个深度内的所有feature grid都被优化
+        # 所以一个猜测是，如果depth为0的点太多，优化速度可能会变慢(计算量增加了)
         zero_mask = (depths == 0)
         depths[zero_mask] = np.max(depths)
 
@@ -246,6 +249,7 @@ class Mapper(object):
         Returns:
             cur_c2w/None (tensor/None): return the updated cur_c2w, return None if no BA
         """
+        # TODO 要了解该函数在深度为0的点处是如何处理的，就要看该函数中所有和cur_gt_depth相关的地方
         H, W, fx, fy, cx, cy = self.H, self.W, self.fx, self.fy, self.cx, self.cy
         c = self.c
         cfg = self.cfg
@@ -253,14 +257,18 @@ class Mapper(object):
         bottom = torch.from_numpy(np.array([0, 0, 0, 1.]).reshape(
             [1, 4])).type(torch.float32).to(device)
 
+        # 关键帧选择
         if len(keyframe_dict) == 0:
             optimize_frame = []
         else:
+            # TODO 如果keyframe_dict的长度小于num呢？
             if self.keyframe_selection_method == 'global':
                 num = self.mapping_window_size-2
                 optimize_frame = random_select(len(self.keyframe_dict)-1, num)
             elif self.keyframe_selection_method == 'overlap':
+                # -2是因为必定优化当前帧和上一个关键帧
                 num = self.mapping_window_size-2
+                # TODO keyframe_dict[:-1]是否保证了不会选中最后一个关键帧？(因为必定优化上一个关键帧，保证不选重复了)
                 optimize_frame = self.keyframe_selection_overlap(
                     cur_gt_color, cur_gt_depth, cur_c2w, keyframe_dict[:-1], num)
 
@@ -288,6 +296,7 @@ class Mapper(object):
 
         pixs_per_image = self.mapping_pixels//len(optimize_frame)
 
+        # 选择要优化的feature grid
         decoders_para_list = []
         coarse_grid_para = []
         middle_grid_para = []
@@ -298,6 +307,8 @@ class Mapper(object):
             if self.frustum_feature_selection:
                 masked_c_grad = {}
                 mask_c2w = cur_c2w
+            # 对每层grid的筛选，都只对当前帧而言的，只根据当前帧筛选需要优化的feature grid
+            # optimize_frame中的其他需要优化的帧不考虑
             for key, val in c.items():
                 if not self.frustum_feature_selection:
                     val = Variable(val.to(device), requires_grad=True)
@@ -332,6 +343,7 @@ class Mapper(object):
                     elif key == 'grid_color':
                         color_grid_para.append(val_grad)
 
+        # 如果不固定fine_deckder/color_decoder的网络参数，就把网络参数也加入优化列表
         if self.nice:
             if not self.fix_fine:
                 decoders_para_list += list(
@@ -343,6 +355,7 @@ class Mapper(object):
             # imap*, single MLP
             decoders_para_list += list(self.decoders.parameters())
 
+        # 如果要进行BA，就将除了最早的优化帧以外的其他优化帧的pose变成四元数加入优化列表
         if self.BA:
             camera_tensor_list = []
             gt_camera_tensor_list = []
@@ -391,6 +404,7 @@ class Mapper(object):
         for joint_iter in range(num_joint_iters):
             if self.nice:
                 if self.frustum_feature_selection:
+                    # TODO 更新全局feature grid?
                     for key, val in c.items():
                         if (self.coarse_mapper and 'coarse' in key) or \
                                 ((not self.coarse_mapper) and ('coarse' not in key)):
@@ -414,6 +428,7 @@ class Mapper(object):
                 optimizer.param_groups[2]['lr'] = cfg['mapping']['stage'][self.stage]['middle_lr']*lr_factor
                 optimizer.param_groups[3]['lr'] = cfg['mapping']['stage'][self.stage]['fine_lr']*lr_factor
                 optimizer.param_groups[4]['lr'] = cfg['mapping']['stage'][self.stage]['color_lr']*lr_factor
+                # 如果有BA, color阶段才优化pose
                 if self.BA:
                     if self.stage == 'color':
                         optimizer.param_groups[5]['lr'] = self.BA_cam_lr
@@ -433,6 +448,7 @@ class Mapper(object):
             batch_gt_depth_list = []
             batch_gt_color_list = []
 
+            # 对每个要优化的帧，随机选择帧内的pixs_per_image个pixels并得到这些pixels的rays
             camera_tensor_id = 0
             for frame in optimize_frame:
                 if frame != -1:
@@ -484,9 +500,11 @@ class Mapper(object):
                                                  gt_depth=None if self.coarse_mapper else batch_gt_depth)
             depth, uncertainty, color = ret
 
+            # 这里考虑到了gt depth中有为0的情况，过滤掉这些点的loss计算
             depth_mask = (batch_gt_depth > 0)
             loss = torch.abs(
                 batch_gt_depth[depth_mask]-depth[depth_mask]).sum()
+            # 只有在color stage才利用渲染的color计算loss
             if ((not self.nice) or (self.stage == 'color')):
                 color_loss = torch.abs(batch_gt_color - color).sum()
                 weighted_color_loss = self.w_color_loss*color_loss
@@ -547,6 +565,9 @@ class Mapper(object):
         init = True
         prev_idx = -1
         while (1):
+            # every_frame指每隔多少帧优化一次feature grid
+            # 所以strict这里是等待，直到idx(当前处理的图片的index)满足整除every_frame之前
+            # 都进行sleep(0.1)
             while True:
                 idx = self.idx[0].clone()
                 if idx == self.n_img-1:
@@ -573,6 +594,7 @@ class Mapper(object):
 
             if not init:
                 lr_factor = cfg['mapping']['lr_factor']
+                # 联合优化次数？
                 num_joint_iters = cfg['mapping']['iters']
 
                 # here provides a color refinement postprocess
@@ -586,6 +608,7 @@ class Mapper(object):
                     self.frustum_feature_selection = False
                 else:
                     if self.nice:
+                        # 外部联合优化次数？
                         outer_joint_iters = 1
                     else:
                         outer_joint_iters = 3
@@ -597,6 +620,7 @@ class Mapper(object):
 
             cur_c2w = self.estimate_c2w_list[idx].to(self.device)
             num_joint_iters = num_joint_iters//outer_joint_iters
+            # Mapper优化主循环
             for outer_joint_iter in range(outer_joint_iters):
 
                 self.BA = (len(self.keyframe_list) > 4) and cfg['mapping']['BA'] and (
@@ -604,6 +628,7 @@ class Mapper(object):
 
                 _ = self.optimize_map(num_joint_iters, lr_factor, idx, gt_color, gt_depth,
                                       gt_c2w, self.keyframe_dict, self.keyframe_list, cur_c2w=cur_c2w)
+                # 当满足BA时，Mapper应该会连带pose一块儿优化，所以这里把优化过的pose放到估计Pose序列里
                 if self.BA:
                     cur_c2w = _
                     self.estimate_c2w_list[idx] = cur_c2w
@@ -629,7 +654,7 @@ class Mapper(object):
                     self.logger.log(idx, self.keyframe_dict, self.keyframe_list,
                                     selected_keyframes=self.selected_keyframes
                                     if self.save_selected_keyframes_info else None)
-
+                # 记录mapping处理完数据集第几帧了
                 self.mapping_idx[0] = idx
                 self.mapping_cnt[0] += 1
 

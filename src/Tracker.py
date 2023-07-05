@@ -58,6 +58,7 @@ class Tracker(object):
         self.no_vis_on_first_frame = cfg['mapping']['no_vis_on_first_frame']
 
         self.prev_mapping_idx = -1
+        # Tracker和Mapper中都加载一遍dataset可能是因为防止线程访问同一个资源导致冲突
         self.frame_reader = get_dataset(
             cfg, args, self.scale, device=self.device)
         self.n_img = len(self.frame_reader)
@@ -107,6 +108,8 @@ class Tracker(object):
             self.c, self.decoders, batch_rays_d, batch_rays_o,  self.device, stage='color',  gt_depth=batch_gt_depth)
         depth, uncertainty, color = ret
 
+        # 和mapper里一样，这里的思路也是对pixels的采样完全随机，渲染完毕计算loss时加上一个mask，
+        # 只不过这里的mask会包括对动态物体的过滤以及对depth=0的点的过滤两部分
         uncertainty = uncertainty.detach()
         if self.handle_dynamic:
             tmp = torch.abs(batch_gt_depth-depth)/torch.sqrt(uncertainty+1e-10)
@@ -132,6 +135,7 @@ class Tracker(object):
         Update the parameters of scene representation from the mapping thread.
 
         """
+        # mapper每隔一定帧才优化一次，所以没优化的时候不用更新
         if self.mapping_idx[0] != self.prev_mapping_idx:
             if self.verbose:
                 print('Tracking: update the parameters from mapping')
@@ -149,6 +153,7 @@ class Tracker(object):
         else:
             pbar = tqdm(self.frame_loader)
 
+        # tracker启动以后遍历所有帧然后结束
         for idx, gt_color, gt_depth, gt_c2w in pbar:
             if not self.verbose:
                 pbar.set_description(f"Tracking Frame {idx[0]}")
@@ -158,6 +163,10 @@ class Tracker(object):
             gt_color = gt_color[0]
             gt_c2w = gt_c2w[0]
 
+            # strict策略下，tracker每优化完every_frame个帧之后等mapper
+            # 例如若every_frame是5，tracker跑完2 3 4 5帧以后，到6帧时才等mapper，
+            # 因为mapper那边此时2 3 4帧都不做优化，5帧才做优化，
+            # 所以tracker在2 3 4帧等mapper是没用的，那边在这几帧不会启动
             if self.sync_method == 'strict':
                 # strictly mapping and then tracking
                 # initiate mapping every self.every_frame frames
@@ -180,21 +189,24 @@ class Tracker(object):
                 print(Fore.MAGENTA)
                 print("Tracking Frame ",  idx.item())
                 print(Style.RESET_ALL)
-
+            # 第0帧，或者设置了不优化位姿直接用gt位姿时，c2w(估计的位姿)就设置成gt位姿
             if idx == 0 or self.gt_camera:
                 c2w = gt_c2w
                 if not self.no_vis_on_first_frame:
                     self.visualizer.vis(
                         idx, 0, gt_depth, gt_color, c2w, self.c, self.decoders)
-
+            # 否则进入tracking主优化过程
             else:
+                # 从4*4变换矩阵得到四元数
                 gt_camera_tensor = get_tensor_from_camera(gt_c2w)
+                # 根据匀速运动模型从pre_c2w(上一帧估计的位姿)得到当前帧估计位姿的初始值
                 if self.const_speed_assumption and idx-2 >= 0:
                     pre_c2w = pre_c2w.float()
                     delta = pre_c2w@self.estimate_c2w_list[idx-2].to(
                         device).float().inverse()
                     estimated_new_cam_c2w = delta@pre_c2w
                 else:
+                # 否则直接拿上一帧估计位姿当作当前帧位姿的初始值
                     estimated_new_cam_c2w = pre_c2w
 
                 camera_tensor = get_tensor_from_camera(
@@ -220,8 +232,9 @@ class Tracker(object):
 
                 initial_loss_camera_tensor = torch.abs(
                     gt_camera_tensor.to(device)-camera_tensor).mean().item()
-                candidate_cam_tensor = None
+                candidate_cam_tensor = None 
                 current_min_loss = 10000000000.
+                # 优化num_cam_iters次，挑出来loss最小的位姿当作当前帧估计位姿
                 for cam_iter in range(self.num_cam_iters):
                     if self.seperate_LR:
                         camera_tensor = torch.cat([quad, T], 0).to(self.device)
@@ -245,6 +258,7 @@ class Tracker(object):
                     if loss < current_min_loss:
                         current_min_loss = loss
                         candidate_cam_tensor = camera_tensor.clone().detach()
+                # loss最小的位姿经过变换，得到4*4变换矩阵c2w，即当前帧位姿估计结果
                 bottom = torch.from_numpy(np.array([0, 0, 0, 1.]).reshape(
                     [1, 4])).type(torch.float32).to(self.device)
                 c2w = get_camera_from_tensor(
@@ -253,6 +267,7 @@ class Tracker(object):
             self.estimate_c2w_list[idx] = c2w.clone().cpu()
             self.gt_c2w_list[idx] = gt_c2w.clone().cpu()
             pre_c2w = c2w.clone()
+            # NICE_SLAM.py中的idx更新完全由tracker进行
             self.idx[0] = idx
             if self.low_gpu_mem:
                 torch.cuda.empty_cache()

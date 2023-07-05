@@ -134,6 +134,7 @@ class NICE_SLAM():
             self.cx -= self.cfg['cam']['crop_edge']
             self.cy -= self.cfg['cam']['crop_edge']
 
+    # nice_slam.yaml里面没有bound，那这个bound怎么读？
     def load_bound(self, cfg):
         """
         Pass the scene bound parameters to different decoders and self.
@@ -208,6 +209,7 @@ class NICE_SLAM():
 
         c = {}
         c_dim = cfg['model']['c_dim']
+        # xyz_len是场景在三个方向上的长度
         xyz_len = self.bound[:, 1]-self.bound[:, 0]
 
         # If you have questions regarding the swap of axis 0 and 2,
