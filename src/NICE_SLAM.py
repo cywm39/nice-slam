@@ -134,7 +134,6 @@ class NICE_SLAM():
             self.cx -= self.cfg['cam']['crop_edge']
             self.cy -= self.cfg['cam']['crop_edge']
 
-    # nice_slam.yaml里面没有bound，那这个bound怎么读？
     def load_bound(self, cfg):
         """
         Pass the scene bound parameters to different decoders and self.
@@ -149,6 +148,10 @@ class NICE_SLAM():
         # enlarge the bound a bit to allow it divisible by bound_divisible
         self.bound[:, 1] = (((self.bound[:, 1]-self.bound[:, 0]) /
                             bound_divisible).int()+1)*bound_divisible+self.bound[:, 0]
+        print("self.bound: ", self.bound)
+        self.bound.share_memory_()
+        # 查看decoder.py中发现，其中对bound的使用仅限于对点的坐标进行归一化，不过如果换了bound还是需要把decoder里面的bound换一下
+        # TODO 但是仔细一想修改bound后，归一化坐标的定义也会发生改变，可能导致网络也发生变化？这个产生的影响先忽略，如果出问题再讨论
         if self.nice:
             self.shared_decoders.bound = self.bound
             self.shared_decoders.middle_decoder.bound = self.bound
@@ -221,6 +224,7 @@ class NICE_SLAM():
                 map(int, (xyz_len*self.coarse_bound_enlarge/coarse_grid_len).tolist()))
             coarse_val_shape[0], coarse_val_shape[2] = coarse_val_shape[2], coarse_val_shape[0]
             self.coarse_val_shape = coarse_val_shape
+            print("self.coarse_val_shape: ", self.coarse_val_shape)
             val_shape = [1, c_dim, *coarse_val_shape]
             coarse_val = torch.zeros(val_shape).normal_(mean=0, std=0.01)
             c[coarse_key] = coarse_val
@@ -229,6 +233,7 @@ class NICE_SLAM():
         middle_val_shape = list(map(int, (xyz_len/middle_grid_len).tolist()))
         middle_val_shape[0], middle_val_shape[2] = middle_val_shape[2], middle_val_shape[0]
         self.middle_val_shape = middle_val_shape
+        print("self.middle_val_shape", self.middle_val_shape)
         val_shape = [1, c_dim, *middle_val_shape]
         middle_val = torch.zeros(val_shape).normal_(mean=0, std=0.01)
         c[middle_key] = middle_val
@@ -237,6 +242,7 @@ class NICE_SLAM():
         fine_val_shape = list(map(int, (xyz_len/fine_grid_len).tolist()))
         fine_val_shape[0], fine_val_shape[2] = fine_val_shape[2], fine_val_shape[0]
         self.fine_val_shape = fine_val_shape
+        print("self.fine_val_shape: ", self.fine_val_shape)
         val_shape = [1, c_dim, *fine_val_shape]
         fine_val = torch.zeros(val_shape).normal_(mean=0, std=0.0001)
         c[fine_key] = fine_val
@@ -245,13 +251,14 @@ class NICE_SLAM():
         color_val_shape = list(map(int, (xyz_len/color_grid_len).tolist()))
         color_val_shape[0], color_val_shape[2] = color_val_shape[2], color_val_shape[0]
         self.color_val_shape = color_val_shape
+        print("self.color_val_shape: ", self.color_val_shape)
         val_shape = [1, c_dim, *color_val_shape]
         color_val = torch.zeros(val_shape).normal_(mean=0, std=0.01)
         c[color_key] = color_val
 
         self.shared_c = c
 
-    def tracking(self, rank):
+    def tracking(self, rank, queue, is_update_bound):
         """
         Tracking Thread.
 
@@ -265,9 +272,9 @@ class NICE_SLAM():
                 break
             time.sleep(1)
 
-        self.tracker.run()
+        self.tracker.run(queue, is_update_bound)
 
-    def mapping(self, rank):
+    def mapping(self, rank, queue, is_update_bound):
         """
         Mapping Thread. (updates middle, fine, and color level)
 
@@ -275,9 +282,9 @@ class NICE_SLAM():
             rank (int): Thread ID.
         """
 
-        self.mapper.run()
+        self.mapper.run(queue, is_update_bound)
 
-    def coarse_mapping(self, rank):
+    def coarse_mapping(self, rank, queue, is_update_bound):
         """
         Coarse mapping Thread. (updates coarse level)
 
@@ -285,22 +292,25 @@ class NICE_SLAM():
             rank (int): Thread ID.
         """
 
-        self.coarse_mapper.run()
+        self.coarse_mapper.run(queue, is_update_bound)
 
     def run(self):
         """
         Dispatch Threads.
         """
-
+        # is_update_bound原来是用来判断是否更新bound的，但是后来改成mapper给tracker发送grid后就不需要这个了，可以删除
+        is_update_bound = torch.tensor([False, False])
+        is_update_bound.share_memory_()
+        queue = mp.Queue()
         processes = []
         for rank in range(3):
             if rank == 0:
-                p = mp.Process(target=self.tracking, args=(rank, ))
+                p = mp.Process(target=self.tracking, args=(rank, queue, is_update_bound))
             elif rank == 1:
-                p = mp.Process(target=self.mapping, args=(rank, ))
+                p = mp.Process(target=self.mapping, args=(rank, queue, is_update_bound))
             elif rank == 2:
                 if self.coarse:
-                    p = mp.Process(target=self.coarse_mapping, args=(rank, ))
+                    p = mp.Process(target=self.coarse_mapping, args=(rank, queue, is_update_bound))
                 else:
                     continue
             p.start()

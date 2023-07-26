@@ -104,6 +104,10 @@ class Tracker(object):
             batch_gt_depth = batch_gt_depth[inside_mask]
             batch_gt_color = batch_gt_color[inside_mask]
 
+        #if 'grid_fine' in self.c:
+            #print('grid_fine is in self.c.')
+        #else:
+            #print('grid_fine is not in self.c')
         ret = self.renderer.render_batch_ray(
             self.c, self.decoders, batch_rays_d, batch_rays_o,  self.device, stage='color',  gt_depth=batch_gt_depth)
         depth, uncertainty, color = ret
@@ -130,7 +134,7 @@ class Tracker(object):
         optimizer.zero_grad()
         return loss.item()
 
-    def update_para_from_mapping(self):
+    def update_para_from_mapping(self, queue):
         """
         Update the parameters of scene representation from the mapping thread.
 
@@ -140,12 +144,34 @@ class Tracker(object):
             if self.verbose:
                 print('Tracking: update the parameters from mapping')
             self.decoders = copy.deepcopy(self.shared_decoders).to(self.device)
-            for key, val in self.shared_c.items():
-                val = val.clone().to(self.device)
-                self.c[key] = val
+            # Tracking线程中用到的grid不是self.shared_c而是self.c，self.shared_c来自slam.shared_c，
+            # slam.shared_c被放到了显存上，所以是共享的，mapper中的修改tracker中也能实时看到，
+            # 那么既然这样为什么tracker中不直接使用self.shared_c，而是每当mapping更新了地图的时候就copy一个副本下来用？
+            # for key, val in self.shared_c.items():
+            #     val = val.clone().to(self.device)
+            #     self.c[key] = val
+            received_mapper = False
+            received_coarse_mappper = False
+            while True:
+                value = queue.get()
+                if 'grid_middle' in value:
+                    for key, val in value.items():
+                        tmp = torch.from_numpy(val)
+                        self.c[key] = tmp.to(self.device)
+                        print("copied " + str(key) + " grid to Tracker.")
+                elif 'grid_coarse' in value:
+                    tmp = torch.from_numpy(value['grid_coarse'])
+                    self.c['grid_coarse'] = tmp.to(self.device)
+                    print("copied " + "grid_coarse" + " grid to Tracker.")
+                elif value == "Mapper_end":
+                    received_mapper = True
+                elif value == "Coarse_mapper_end":
+                    received_coarse_mappper = True
+                if received_mapper and received_coarse_mappper:
+                    break
             self.prev_mapping_idx = self.mapping_idx[0].clone()
 
-    def run(self):
+    def run(self, queue, is_update_bound):
         device = self.device
         self.c = {}
         if self.verbose:
@@ -162,6 +188,74 @@ class Tracker(object):
             gt_depth = gt_depth[0]
             gt_color = gt_color[0]
             gt_c2w = gt_c2w[0]
+
+            if False:
+                print("---------------------------------------------change bound---------------------------------------------")
+                values = [[-2.9000, 8.9400],
+                        [-3.2000, 5.7600],
+                        [-3.5000, 3.5400]]
+                new_bound = torch.tensor(values, dtype=torch.float64)
+                # new_bound.share_memory_()
+                # self.slam.bound = new_bound.clone().cpu()
+                self.bound[0][0] = 0
+                if self.slam.nice:
+                    self.slam.shared_decoders.bound = self.slam.bound
+                    self.slam.shared_decoders.middle_decoder.bound = self.slam.bound
+                    self.slam.shared_decoders.fine_decoder.bound = self.slam.bound
+                    self.slam.shared_decoders.color_decoder.bound = self.slam.bound
+                    if self.slam.coarse:
+                        self.slam.shared_decoders.coarse_decoder.bound = self.slam.bound*self.slam.coarse_bound_enlarge
+
+                # coarse_padding_tensor = torch.zeros([1, 32, 7, 8, 5]).normal_(mean=0, std=0.01)
+                # coarse_padding_tensor = coarse_padding_tensor.to(self.cfg['mapping']['device'])
+                # coarse_padding_tensor.share_memory_()
+                # coarse_source_tensor = self.slam.shared_c['grid_coarse']
+                # self.slam.shared_c['grid_coarse'] = torch.cat([coarse_source_tensor, coarse_padding_tensor], dim=-1)
+
+                middle_padding_tensor = torch.zeros([1, 32, 21, 28, 3]).normal_(mean=0, std=0.01)
+                middle_padding_tensor = middle_padding_tensor.to(self.cfg['mapping']['device'])
+                middle_padding_tensor.share_memory_()
+                middle_source_tensor = self.slam.shared_c['grid_middle']
+                self.slam.shared_c['grid_middle'] = torch.cat([middle_source_tensor, middle_padding_tensor], dim=-1)
+
+                fine_padding_tensor = torch.zeros([1, 32, 43, 56, 5]).normal_(mean=0, std=0.01)
+                fine_padding_tensor = fine_padding_tensor.to(self.cfg['mapping']['device'])
+                fine_padding_tensor.share_memory_()
+                fine_source_tensor = self.slam.shared_c['grid_fine']
+                self.slam.shared_c['grid_fine'] = torch.cat([fine_source_tensor, fine_padding_tensor], dim=-1)
+
+                color_padding_tensor = torch.zeros([1, 32, 43, 56, 5]).normal_(mean=0, std=0.01)
+                color_padding_tensor = color_padding_tensor.to(self.cfg['mapping']['device'])
+                color_padding_tensor.share_memory_()
+                color_source_tensor = self.slam.shared_c['grid_color']
+                self.slam.shared_c['grid_color'] = torch.cat([color_source_tensor, color_padding_tensor], dim=-1)
+                
+                
+                self.slam.renderer.bound = self.slam.bound
+                self.slam.mesher.renderer = self.slam.renderer
+                self.slam.mesher.bound = self.slam.bound
+                self.slam.logger.shared_c = self.slam.shared_c
+                self.slam.logger.shared_decoders = self.slam.shared_decoders
+                self.slam.mapper.c = self.slam.shared_c
+                self.slam.mapper.bound = self.slam.bound
+                self.slam.mapper.logger = self.slam.logger
+                self.slam.mapper.mesher = self.slam.mesher
+                self.slam.mapper.renderer = self.slam.renderer
+                self.slam.mapper.decoders = self.slam.shared_decoders
+
+                self.slam.coarse_mapper.c = self.slam.shared_c
+                self.slam.coarse_mapper.bound = self.slam.bound
+                self.slam.coarse_mapper.logger = self.slam.logger
+                self.slam.coarse_mapper.mesher = self.slam.mesher
+                self.slam.coarse_mapper.renderer = self.slam.renderer
+                self.slam.coarse_mapper.decoders = self.slam.shared_decoders
+
+                self.bound = self.slam.bound
+                self.mesher = self.slam.mesher
+                self.shared_c = self.slam.shared_c
+                self.renderer = self.slam.renderer
+                self.shared_decoders = self.slam.shared_decoders
+                
 
             # strict策略下，tracker每优化完every_frame个帧之后等mapper
             # 例如若every_frame是5，tracker跑完2 3 4 5帧以后，到6帧时才等mapper，
@@ -183,7 +277,7 @@ class Tracker(object):
                 # pure parallel, if mesh/vis happens may cause inbalance
                 pass
 
-            self.update_para_from_mapping()
+            self.update_para_from_mapping(queue)
 
             if self.verbose:
                 print(Fore.MAGENTA)
@@ -271,3 +365,4 @@ class Tracker(object):
             self.idx[0] = idx
             if self.low_gpu_mem:
                 torch.cuda.empty_cache()
+        print("Tracker: End")

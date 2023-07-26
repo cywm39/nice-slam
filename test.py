@@ -1,49 +1,65 @@
-# import numpy as np
-import cv2
+import torch
+import torch.multiprocessing as mp
+from torch.multiprocessing import Process, Queue
+import time
+import numpy as np
 
-# # 读取深度图像
-# depth_image = cv2.imread('./Datasets/Apartment/depth/00000.png', cv2.IMREAD_ANYDEPTH)
+def producer(queue, mark):
+    # for item in data:
+    #     queue.put(item)
+    # queue.put(None)  # Use None as the sentinel to signal the end of data
+    tmp = torch.tensor([1.1,2.2,3.3,4.4,5.5])
+    queue.put({'type': 'coarse', 'grid': tmp.numpy()})
+    # queue.put(None)
+    mark[0] = True
+    time.sleep(10)
+    tmp[0] = 6.6
 
-# # 获取深度图像的行数和列数
-# rows, cols = depth_image.shape
+def consumer(queue, mark):
+    # while True:
+    #     item = queue.get()
+    #     if item is None:
+    #         break  # Break the loop when encountering the sentinel
+    #     print("Consumer got:", item)
+    while mark[0] == False:
+        continue
+    # while True:
+    #     item = queue.get()
+    #     if item is None:
+    #         break
+    #     print("consumer got: ", item)
+    tmp = queue.get()
+    print("consumer first got: ", tmp)
+    mark[0] = False
+    time.sleep(15)
+    print("tmp now: ", tmp)
 
-# # 将深度值输出到 txt 文件
-# with open('./depth_values.txt', 'w') as file:
-#     for row in range(rows):
-#         for col in range(cols):
-#             depth_value = depth_image[row, col]
-#             file.write(f'{depth_value}\t')
-#         file.write('\n')
+if __name__ == '__main__':
+    # mp.set_start_method('spawn', force=True)
+    # mark = torch.tensor([False])
+    # mark.share_memory_()
+    # # Create a shared queue
+    # queue = Queue()
+    
 
-# from src import config
-# cfg = config.load_config(
-#         'configs/Apartment/apartment.yaml', 'configs/nice_slam.yaml')
-# print(cfg['cam']['H'])
-# print(cfg['mapping']['lr_first_factor'])
-# print(cfg['cam']['H'])
+    # # Data to be sent to the consumer
+    # # data = [1, 2, 3, 4, 5]
 
-depth_image = cv2.imread('./Datasets/Apartment/depth_random_filter_20/00000.png', cv2.IMREAD_ANYDEPTH)
-height, width = depth_image.shape
-# print(height)
-# print(width)
-# depth_image[0, width-1] = 0
-# 将深度值输出到 txt 文件
-with open('./filter20_00000.txt', 'w') as file:
-    for row in range(height):
-        for col in range(width):
-            depth_value = depth_image[row, col]
-            file.write(f'{depth_value}\t')
-        file.write('\n')
+    # # Create two processes, one for producer and the other for consumer
+    # p_producer = Process(target=producer, args=(queue, mark))
+    # p_consumer = Process(target=consumer, args=(queue, mark))
 
-depth_image = cv2.imread('./Datasets/Apartment/depth/00000.png', cv2.IMREAD_ANYDEPTH)
-height, width = depth_image.shape
-# print(height)
-# print(width)
-# depth_image[0, width-1] = 0
-# 将深度值输出到 txt 文件
-with open('./00000.txt', 'w') as file:
-    for row in range(height):
-        for col in range(width):
-            depth_value = depth_image[row, col]
-            file.write(f'{depth_value}\t')
-        file.write('\n')
+    # # Start both processes
+    # p_producer.start()
+    # p_consumer.start()
+
+    # # Wait for both processes to finish
+    # p_producer.join()
+    # p_consumer.join()
+    # print("main: ", mark[0])
+    x = torch.zeros([2,3])
+    print(x)
+    y = torch.ones([2,2])
+    print(y)
+    result = torch.cat([x, y], dim=-1)
+    print(result)

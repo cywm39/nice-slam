@@ -1,6 +1,12 @@
 import argparse
 import random
 
+import cv2
+cv2.setNumThreads(3) 
+
+import os
+os.environ['OPENBLAS_NUM_THREADS'] = '3' 
+
 import numpy as np
 import torch
 

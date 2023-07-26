@@ -66,6 +66,7 @@ class Mapper(object):
         self.middle_iter_ratio = cfg['mapping']['middle_iter_ratio']
         self.mesh_coarse_level = cfg['meshing']['mesh_coarse_level']
         self.mapping_window_size = cfg['mapping']['mapping_window_size']
+        self.coarse_bound_enlarge = cfg['model']['coarse_bound_enlarge']
         self.no_vis_on_first_frame = cfg['mapping']['no_vis_on_first_frame']
         self.no_log_on_first_frame = cfg['mapping']['no_log_on_first_frame']
         self.no_mesh_on_first_frame = cfg['mapping']['no_mesh_on_first_frame']
@@ -104,6 +105,7 @@ class Mapper(object):
             mask (tensor): mask for selected optimizable feature.
             points (tensor): corresponding point coordinates.
         """
+        # 得到grid中每个点的坐标
         H, W, fx, fy, cx, cy, = self.H, self.W, self.fx, self.fy, self.cx, self.cy
         X, Y, Z = torch.meshgrid(torch.linspace(self.bound[0][0], self.bound[0][1], val_shape[2]),
                                  torch.linspace(self.bound[1][0], self.bound[1][1], val_shape[1]),
@@ -113,6 +115,7 @@ class Mapper(object):
         if key == 'grid_coarse':
             mask = np.ones(val_shape[::-1]).astype(np.bool)
             return mask
+        # 先把世界坐标系下的点坐标转化成相机中的uv坐标
         points_bak = points.clone()
         c2w = c2w.cpu().numpy()
         w2c = np.linalg.inv(c2w)
@@ -128,6 +131,7 @@ class Mapper(object):
         uv = uv[:, :2]/z
         uv = uv.astype(np.float32)
 
+        # 利用remap函数得到深度图中每个上面得到的uv坐标处的深度值
         remap_chunk = int(3e4)
         depths = []
         for i in range(0, uv.shape[0], remap_chunk):
@@ -137,25 +141,34 @@ class Mapper(object):
                                  interpolation=cv2.INTER_LINEAR)[:, 0].reshape(-1, 1)]
         depths = np.concatenate(depths, axis=0)
 
+        # 第一个筛选条件：筛选变到uv坐标后仍在相机H W范围内的grid点
         edge = 0
         mask = (uv[:, 0] < W-edge)*(uv[:, 0] > edge) * \
             (uv[:, 1] < H-edge)*(uv[:, 1] > edge)
 
         # For ray with depth==0, fill it with maximum depth
-        # 原因：若使用depth判断哪些feature grid上的点需要优化，而depth为0的点处深度不可用，
-        # 所以保守起见depth设置为最大值，让这个深度内的所有feature grid都被优化
+        # 原因：若使用物体深度值判断哪些feature grid上的点需要优化，而depth为0的点处深度不可用，
+        # 所以保守起见这些像素上物体深度设置为最大值，让这个深度内的所有feature grid都被优化
         # 所以一个猜测是，如果depth为0的点太多，优化速度可能会变慢(计算量增加了)
         zero_mask = (depths == 0)
         depths[zero_mask] = np.max(depths)
 
         # depth test
+        # 第二个筛选条件：筛选z值大于等于0（即在相机正面），同时小于等于该像素点处物体深度值+0.5的grid点
+        # 这里注意区分z和depths，z是所有grid点转换到相机坐标系下的z轴值
+        # depths是从深度图计算得到的，也就是从相机拍到的物体深度计算得到的，是在grid点转换到相机uv坐标系下的这些uv坐标上的物体深度值
+        # 所以depths表示这个像素点处物体的可能深度，这里的筛选条件去掉了深度大于物体深度+0.5的grid点，也就是大约在物体后面的grid点被去掉了
+        # 这或许也来自于depth supervised NeRF中的，只需要物体表面附近的点就可以完成渲染了，ray上更深处的点则由于遮挡作用不被需要
         mask = mask & (0 <= -z[:, :, 0]) & (-z[:, :, 0] <= depths+0.5)
         mask = mask.reshape(-1)
 
         # add feature grid near cam center
+        # ray_o就是光线起点，或者说变换矩阵中的平移的部分，或者说相机中心点在世界坐标系下的坐标
         ray_o = c2w[:3, 3]
         ray_o = torch.from_numpy(ray_o).unsqueeze(0)
-
+        # 第三个筛选条件：注意points_bak是所有的grid点，所以这里是计算所有的grid点和相机中心点的距离
+        # 然后选出距离相机中心点比较近的grid点，同时由于用的是|不是&，所以相当于另外加上一部分额外的点
+        # 并且由于筛选条件只是距离相机中心点的距离，所以哪怕在相机后面的点也会被选上，这里的目的就只是选择中心点附近的grid点而已
         dist = points_bak-ray_o
         dist = torch.sum(dist*dist, axis=1)
         mask2 = dist < 0.5*0.5
@@ -327,6 +340,39 @@ class Mapper(object):
                         mask_c2w, key, val.shape[2:], gt_depth_np)
                     mask = torch.from_numpy(mask).permute(2, 1, 0).unsqueeze(
                         0).unsqueeze(0).repeat(1, val.shape[1], 1, 1, 1)
+                    # if key == 'grid_middle' and self.coarse_mapper == False:
+                    #     print('save middle mask for idx =' + str(idx))
+                    #     print('val.shape=' + str(val.shape))
+                    #     with open('./tmp/mask_middle_' + str(idx) + '.txt', 'w') as file:
+                    #         elements_per_line = mask.size(-1)
+                    #         total_elements = mask.numel()
+                    #         rows_per_mark = 28
+                    #         mark = '-' * 40
+                            
+                    #         for i, element in enumerate(mask.view(-1)[:21756]):
+                    #             file.write(str(element.item()))
+                                
+                    #             # 添加每行的空格
+                    #             if (i + 1) % elements_per_line != 0:
+                    #                 file.write(' ')
+                                
+                    #             # 每37个元素换行
+                    #             if (i + 1) % elements_per_line == 0:
+                    #                 file.write('\n')
+                                
+                    #             # 每28行添加标记
+                    #             if (i + 1) % (elements_per_line * rows_per_mark) == 0:
+                    #                 file.write(mark)
+                    #                 file.write('\n')
+                                
+                    #         # 添加最后一行的换行符
+                    #         if total_elements % elements_per_line != 0:
+                    #             file.write('\n')
+                            
+                    #         # 添加最后的标记
+                    #         if total_elements % (elements_per_line * rows_per_mark) != 0:
+                    #             file.write(mark)
+                    #             file.write('\n')
                     val = val.to(device)
                     # val_grad is the optimizable part, other parameters will be fixed
                     val_grad = val[mask].clone()
@@ -557,7 +603,7 @@ class Mapper(object):
         else:
             return None
 
-    def run(self):
+    def run(self, queue, is_update_bound):
         cfg = self.cfg
         idx, gt_color, gt_depth, gt_c2w = self.frame_reader[0]
 
@@ -589,6 +635,49 @@ class Mapper(object):
                 prefix = 'Coarse ' if self.coarse_mapper else ''
                 print(prefix+"Mapping Frame ", idx.item())
                 print(Style.RESET_ALL)
+            if self.coarse_mapper == True and idx == 55:
+                print("begin debug")
+            # print("Mapper: self.slam.shared_c[\'grid_middle\'].shape=", self.slam.shared_c['grid_middle'].shape)
+            # if idx > 3:
+            #     tmp = self.tracker.test_tensor
+            #     self.tracker.test_tensor = torch.cat([tmp, torch.tensor([1])])
+            #     print('Mapper: self.tracker.test_tensor: ', self.tracker.test_tensor)
+            # 8.1的时候coarse bound不用改，否则还得再加个if改coarse grid
+            if idx == 10 and self.coarse_mapper == False:
+                # 由于bound是share_memory的，所以mapper和coarse mapper两个只用改一次就行
+                print("-----------------------change bound-------------------------")
+                self.bound[0][1] = 8.94
+                if self.nice:
+                    self.decoders.bound = self.bound
+                    self.decoders.middle_decoder.bound = self.bound
+                    self.decoders.fine_decoder.bound = self.bound
+                    self.decoders.color_decoder.bound = self.bound
+                    if self.coarse:
+                        self.decoders.coarse_decoder.bound = self.bound*self.coarse_bound_enlarge
+                # TODO coarse_mapper进行优化的时候也用到了其他level的grid，所以mapper对tracker进行的grid的发送实际上也得给coarse_mapper送一遍
+                # 并且mapper优化的时候也用到了coarse level的grid，所以coarse mapper也得把grid发送给mapper
+                # 这些太混乱了，初步实验先不管这些，先只让mapper修改coarse以外的grid，完了把grid发给tracker，coarse mapper那边先不管
+                middle_padding_tensor = torch.zeros([1, 32, 21, 28, 3]).normal_(mean=0, std=0.01)
+                middle_padding_tensor = middle_padding_tensor.to(self.cfg['mapping']['device'])
+                middle_padding_tensor.share_memory_()
+                middle_source_tensor = self.c['grid_middle']
+                self.c['grid_middle'] = torch.cat([middle_source_tensor, middle_padding_tensor], dim=-1)
+
+                fine_padding_tensor = torch.zeros([1, 32, 43, 56, 5]).normal_(mean=0, std=0.01)
+                fine_padding_tensor = fine_padding_tensor.to(self.cfg['mapping']['device'])
+                fine_padding_tensor.share_memory_()
+                fine_source_tensor = self.c['grid_fine']
+                self.c['grid_fine'] = torch.cat([fine_source_tensor, fine_padding_tensor], dim=-1)
+
+                color_padding_tensor = torch.zeros([1, 32, 43, 56, 5]).normal_(mean=0, std=0.01)
+                color_padding_tensor = color_padding_tensor.to(self.cfg['mapping']['device'])
+                color_padding_tensor.share_memory_()
+                color_source_tensor = self.c['grid_color']
+                self.c['grid_color'] = torch.cat([color_source_tensor, color_padding_tensor], dim=-1)
+            
+            if idx == 15 and self.coarse_mapper == True:
+                print("Coarse Mapper: self.bound: ", self.bound)
+                print("Coarse Mapper: self.decoders.bound: ", self.decoders.bound)
 
             _, gt_color, gt_depth, gt_c2w = self.frame_reader[idx]
 
@@ -641,17 +730,30 @@ class Mapper(object):
                         self.keyframe_dict.append({'gt_c2w': gt_c2w.cpu(), 'idx': idx, 'color': gt_color.cpu(
                         ), 'depth': gt_depth.cpu(), 'est_c2w': cur_c2w.clone()})
 
+            # 最后一帧不发grid给tracker，不然进程不能结束
+            if not self.coarse_mapper and idx < self.n_img-1:
+                queue.put({'grid_middle': self.c['grid_middle'].clone().detach().cpu().numpy(), 
+                           'grid_fine': self.c['grid_fine'].clone().detach().cpu().numpy(),
+                           'grid_color': self.c['grid_color'].clone().detach().cpu().numpy()})
+                queue.put("Mapper_end")
+                print("Mapper: sent 3 grid to Tracker.")
+            if self.coarse_mapper and idx < self.n_img-1:
+                queue.put({'grid_coarse': self.c['grid_coarse'].clone().detach().cpu().numpy()})
+                queue.put("Coarse_mapper_end")
+                print("Coarse: sent coarse grid to Tracker")
+
             if self.low_gpu_mem:
                 torch.cuda.empty_cache()
 
             init = False
-            # mapping of first frame is done, can begin tracking
-            self.mapping_first_frame[0] = 1
 
             if not self.coarse_mapper:
+                # mapping of first frame is done, can begin tracking
+                self.mapping_first_frame[0] = 1
+
                 if ((not (idx == 0 and self.no_log_on_first_frame)) and idx % self.ckpt_freq == 0) \
                         or idx == self.n_img-1:
-                    self.logger.log(idx, self.keyframe_dict, self.keyframe_list,
+                    self.logger.log(idx, self.keyframe_dict, self.keyframe_list, self.c, 
                                     selected_keyframes=self.selected_keyframes
                                     if self.save_selected_keyframes_info else None)
                 # 记录mapping处理完数据集第几帧了
@@ -680,3 +782,7 @@ class Mapper(object):
 
             if idx == self.n_img-1:
                 break
+        if not self.coarse_mapper:
+            print("Mapper: End")
+        if self.coarse_mapper:
+            print("Coarse Mapper: End")

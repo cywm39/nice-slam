@@ -13,15 +13,16 @@ class Logger(object):
                  ):
         self.verbose = slam.verbose
         self.ckptsdir = slam.ckptsdir
-        self.shared_c = slam.shared_c
+        # self.shared_c = slam.shared_c
         self.gt_c2w_list = slam.gt_c2w_list
         self.shared_decoders = slam.shared_decoders
         self.estimate_c2w_list = slam.estimate_c2w_list
 
-    def log(self, idx, keyframe_dict, keyframe_list, selected_keyframes=None):
+    def log(self, idx, keyframe_dict, keyframe_list, shared_c, selected_keyframes=None):
         path = os.path.join(self.ckptsdir, '{:05d}.tar'.format(idx))
         torch.save({
-            'c': self.shared_c,
+            # 'c': self.shared_c,
+            'c': shared_c,
             'decoder_state_dict': self.shared_decoders.state_dict(),
             'gt_c2w_list': self.gt_c2w_list,
             'estimate_c2w_list': self.estimate_c2w_list,
